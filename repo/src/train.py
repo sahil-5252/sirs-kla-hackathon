@@ -1,6 +1,7 @@
 import os
 import sys
 import io
+import csv
 import time
 import random
 import argparse
@@ -11,6 +12,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import CosineAnnealingLR, StepLR, ReduceLROnPlateau
+from tqdm import tqdm
 
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
 
@@ -61,7 +63,7 @@ def evaluate(model, loader, device):
     total_loss = 0.0
     count = 0
 
-    for noisy, gt in loader:
+    for noisy, gt in tqdm(loader, desc='Validating', unit='batch', leave=True, dynamic_ncols=True):
         noisy, gt = noisy.to(device), gt.to(device)
         pred = model(noisy)
         total_loss += F.l1_loss(pred, gt).item() * noisy.shape[0]
@@ -119,6 +121,9 @@ def train(args):
                             num_workers=args.num_workers, pin_memory=True)
 
     print(f"Train pairs: {len(train_ds)} | Val pairs: {len(val_ds)}")
+    print(f"Dataloaders ready: {len(train_loader)} batches/cycle | "
+          f"Steps/epoch {args.steps_per_epoch} | "
+          f"~{args.steps_per_epoch * args.batch_size / max(len(train_ds), 1):.1f} data passes/epoch")
 
     model = RestormerSR(
         inp_channels=1,
@@ -142,6 +147,8 @@ def train(args):
     scheduler = build_scheduler(optimizer, args, args.epochs * args.steps_per_epoch)
 
     os.makedirs(args.save_dir, exist_ok=True)
+    history_path = os.path.join(args.save_dir, 'history.csv')
+    csv_header = ['epoch', 'train_loss', 'val_loss', 'psnr', 'ssim', 'mae', 'lr', 'time_s']
     best_ssim = -1.0
     start_epoch = 0
     global_step = 0
@@ -161,6 +168,8 @@ def train(args):
         t0 = time.time()
 
         # 2000 optimizer steps per epoch (cycle/reshuffle over the data).
+        pbar = tqdm(total=args.steps_per_epoch, desc=f"Epoch {epoch + 1}/{args.epochs}",
+                    unit='step', leave=True, dynamic_ncols=True)
         loader_iter = iter(train_loader)
         while epoch_steps < args.steps_per_epoch:
             try:
@@ -183,6 +192,15 @@ def train(args):
             epoch_steps += 1
             global_step += 1
 
+            pbar.set_postfix({
+                'loss': f"{loss.item():.4f}",
+                'avg': f"{epoch_loss / epoch_steps:.4f}",
+                'pass': f"{epoch_steps * args.batch_size / max(len(train_ds), 1):.2f}",
+                'lr': f"{optimizer.param_groups[0]['lr']:.2e}",
+            })
+            pbar.update(1)
+
+        pbar.close()
         train_loss = epoch_loss / epoch_steps
 
         val_metrics = evaluate(model, val_loader, device)
@@ -200,6 +218,22 @@ def train(args):
             f"LR: {current_lr:.2e} | "
             f"Time: {elapsed:.1f}s"
         )
+
+        file_exists = os.path.isfile(history_path)
+        with open(history_path, 'a', newline='') as f:
+            writer = csv.writer(f)
+            if not file_exists or os.path.getsize(history_path) == 0:
+                writer.writerow(csv_header)
+            writer.writerow([
+                epoch + 1,
+                f"{train_loss:.6f}",
+                f"{val_metrics['loss']:.6f}",
+                f"{val_metrics['psnr']:.6f}",
+                f"{val_metrics['ssim']:.6f}",
+                f"{val_metrics['mae']:.6f}",
+                f"{current_lr:.6e}",
+                f"{elapsed:.1f}",
+            ])
 
         is_best = val_metrics['ssim'] > best_ssim
         if is_best:
