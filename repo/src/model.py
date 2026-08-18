@@ -76,7 +76,10 @@ class RestormerSR(nn.Module):
         if cfg is None:
             raise ValueError("Checkpoint has no 'model_config'. Re-train or provide --dim/--num_blocks/--heads matching the saved weights.")
         model = cls(**cfg)
-        model.load_state_dict(ckpt['model_state_dict'])
+        state_dict = ckpt['model_state_dict']
+        if next(iter(state_dict)).startswith('module.'):
+            state_dict = {k[len('module.'):]: v for k, v in state_dict.items()}
+        model.load_state_dict(state_dict)
         return model
 
     def forward(self, x):
